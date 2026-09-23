@@ -1,0 +1,181 @@
+//Ocean FFT sim - this file uses Tessendorf's method (his SIGGRAPH course notes,
+//"Simulating Ocean Water", 2001) implemented as compute shaders instead of sine waves.
+//
+//One cascade = 4 passes, run in this order every frame by OceanFFTSubsystem.cpp:
+//  1. InitSpectrumCS - builds H0(k)/H0(-k), the frequency spectrum at t=0, from the
+//     Phillips wind spectrum + precomputed Gaussian noise. Only runs once per cascade
+//     unless wind changes.
+//  2. TimeSpectrumCS - evolves H0 to time t (deep water dispersion), also spits out the
+//     horizontal Gerstner/choppy displacement spectra.
+//  3. FFTButterflyCS - inverse FFT of all 3 spectra back to a spatial field. log2(N)
+//     passes for rows then log2(N) for columns.
+//  4. InversionCS - undoes the FFT checkerboard flip and packs everything into the
+//     render target the material actually samples.
+//
+//Each pass is one grid cell per thread, no cross-thread stuff, so it's all trivially
+//parallel on GPU.
+#include "/Engine/Public/Platform.ush"
+
+static const float GRAVITY = 981.0f; //cm/s^2, Unreal units are cm not meters
+static const float PI2 = 6.28318530718f;
+
+float2 ComplexMul(float2 A, float2 B)
+{
+	return float2(A.x * B.x - A.y * B.y, A.x * B.y + A.y * B.x);
+}
+
+//Phillips spectrum - the actual wind-wave energy spectrum, from O.M. Phillips 1958
+//("The equilibrium range in the spectrum of wind-generated waves").
+float PhillipsSpectrum(float2 K, float2 WindDir, float WindSpeed, float SuppressSmallWaves)
+{
+	float KLen = length(K);
+	if (KLen < 0.00001f)
+	{
+		return 0.0f;
+	}
+
+	float L = (WindSpeed * WindSpeed) / GRAVITY; //largest wave for this wind speed
+	float KLen2 = KLen * KLen;
+	float KDotW = dot(normalize(K), WindDir);
+	float Phillips = exp(-1.0f / (KLen2 * L * L)) / (KLen2 * KLen2);
+	Phillips *= KDotW * KDotW;
+
+	//kill waves smaller than SuppressSmallWaves
+	float SmallSuppressor = exp(-KLen2 * SuppressSmallWaves * SuppressSmallWaves);
+	return Phillips * SmallSuppressor;
+}
+
+#if COMPUTESHADER
+
+RWTexture2D<float4> H0Output;
+Texture2D<float4> NoiseTexture;
+uint GridSize;
+float PatchLength;
+float WindSpeed;
+float2 WindDirection;
+float Amplitude;
+float SuppressSmallWaves;
+
+[numthreads(OCEAN_FFT_THREADGROUP_SIZE, OCEAN_FFT_THREADGROUP_SIZE, 1)]
+void InitSpectrumCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 Pos = DispatchThreadId.xy;
+	if (Pos.x >= GridSize || Pos.y >= GridSize)
+	{
+		return;
+	}
+
+	//wave vector K, centered so grid cell (0,0) maps to K=(0,0). shifting like this means
+	//teh FFT output comes out mirrored around the centre instead of the corner - fixed
+	//for free in InversionCS with the (-1)^(x+y) trick, no separate fftshift needed
+	float2 NCoord = float2((float)Pos.x - (float)GridSize * 0.5f, (float)Pos.y - (float)GridSize * 0.5f);
+	float2 K = NCoord * (PI2 / PatchLength);
+	float2 MinusK = -K;
+	float4 Noise = NoiseTexture.Load(int3(Pos, 0)); //(xi0.r, xi0.i, xi1.r, xi1.i), each ~N(0,1)
+	float PK = Amplitude * PhillipsSpectrum(K, WindDirection, WindSpeed, SuppressSmallWaves);
+	float PMinusK = Amplitude * PhillipsSpectrum(MinusK, WindDirection, WindSpeed, SuppressSmallWaves);
+	float2 H0K = Noise.xy * sqrt(PK * 0.5f);
+	float2 H0MinusK = Noise.zw * sqrt(PMinusK * 0.5f);
+
+	H0Output[Pos] = float4(H0K, H0MinusK);
+}
+
+Texture2D<float4> H0Texture;
+RWTexture2D<float2> HktOutput;
+RWTexture2D<float2> DxOutput;
+RWTexture2D<float2> DyOutput;
+float Time;
+
+[numthreads(OCEAN_FFT_THREADGROUP_SIZE, OCEAN_FFT_THREADGROUP_SIZE, 1)]
+void TimeSpectrumCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 Pos = DispatchThreadId.xy;
+	if (Pos.x >= GridSize || Pos.y >= GridSize)
+	{
+		return;
+	}
+	float2 NCoord = float2((float)Pos.x - (float)GridSize * 0.5f, (float)Pos.y - (float)GridSize * 0.5f);
+	float2 K = NCoord * (PI2 / PatchLength);
+	float KLen = max(length(K), 0.00001f);
+	float Omega = sqrt(GRAVITY * KLen);
+	float4 H0 = H0Texture.Load(int3(Pos, 0));
+	float2 H0K = H0.xy;
+	float2 H0MinusKConj = float2(H0.z, -H0.w);
+	float CosOt = cos(Omega * Time);
+	float SinOt = sin(Omega * Time);
+	float2 EulerPos = float2(CosOt, SinOt);
+	float2 EulerNeg = float2(CosOt, -SinOt);
+	float2 Hkt = ComplexMul(H0K, EulerPos) + ComplexMul(H0MinusKConj, EulerNeg);
+	HktOutput[Pos] = Hkt;
+
+	//choppy/Gerstner displacement: D(k,t) = i * (k/|k|) * H(k,t), from Tessendorf 2001.
+	//the *i (90 degree rotation, done below as ComplexMul against float2(0, KDir)) is what
+	//pulls the mesh toward wave crests and away from troughs after the inverse FFT - turns
+	//plain up/down bobbing into actual poinetd Gerstner crests
+	float2 KDir = K / KLen;
+	float2 IKx = float2(0.0f, KDir.x);
+	float2 IKy = float2(0.0f, KDir.y);
+	DxOutput[Pos] = ComplexMul(IKx, Hkt);
+	DyOutput[Pos] = ComplexMul(IKy, Hkt);
+}
+
+Texture2D<float4> ButterflyTexture;
+Texture2D<float2> InputTexture;
+RWTexture2D<float2> OutputTexture;
+uint Stage;
+uint Direction;
+
+//Cooley-Tukey radix-2 FFT, one butterfly stage per dispatch
+[numthreads(OCEAN_FFT_THREADGROUP_SIZE, OCEAN_FFT_THREADGROUP_SIZE, 1)]
+void FFTButterflyCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 Pos = DispatchThreadId.xy;
+	if (Pos.x >= GridSize || Pos.y >= GridSize)
+	{
+		return;
+	}
+	uint AxisCoord = (Direction == 0) ? Pos.x : Pos.y;
+	float4 Butterfly = ButterflyTexture.Load(int3(Stage, AxisCoord, 0));
+	uint IndexA = (uint)Butterfly.x;
+	uint IndexB = (uint)Butterfly.y;
+	float2 Twiddle = Butterfly.zw;
+
+	uint2 PosA = (Direction == 0) ? uint2(IndexA, Pos.y) : uint2(Pos.x, IndexA);
+	uint2 PosB = (Direction == 0) ? uint2(IndexB, Pos.y) : uint2(Pos.x, IndexB);
+
+	float2 A = InputTexture.Load(int3(PosA, 0));
+	float2 B = InputTexture.Load(int3(PosB, 0));
+	float2 TB = ComplexMul(Twiddle, B);
+
+	uint BlockSize = 1u << (Stage + 1u);
+	uint HalfBlock = BlockSize >> 1u;
+	bool bTop = (AxisCoord % BlockSize) < HalfBlock;
+	OutputTexture[Pos] = bTop ? (A + TB) : (A - TB);
+}
+
+Texture2D<float2> HeightFFTResult;
+Texture2D<float2> DxFFTResult;
+Texture2D<float2> DyFFTResult;
+RWTexture2D<float4> HeightOutput;
+float NormalizationScale;
+
+[numthreads(OCEAN_FFT_THREADGROUP_SIZE, OCEAN_FFT_THREADGROUP_SIZE, 1)]
+void InversionCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 Pos = DispatchThreadId.xy;
+	if (Pos.x >= GridSize || Pos.y >= GridSize)
+	{
+		return;
+	}
+	//(-1)^(x+y) - standard trick to recentre an FFT whose input was pre-shifted by half
+	//the grid (see NCoord in InitSpectrumCS). flipping every other pixel's sign does the
+	//recentering for free, no separate fftshift pass needed
+	float Sign = ((Pos.x + Pos.y) % 2u == 0u) ? 1.0f : -1.0f;
+	float Height = HeightFFTResult.Load(int3(Pos, 0)).x * Sign * NormalizationScale;
+	float Dx = DxFFTResult.Load(int3(Pos, 0)).x * Sign * NormalizationScale;
+	float Dy = DyFFTResult.Load(int3(Pos, 0)).x * Sign * NormalizationScale;
+
+	HeightOutput[Pos] = float4(Height, Dx, Dy, 1.0f);
+}
+
+#endif
