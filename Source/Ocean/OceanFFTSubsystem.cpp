@@ -20,26 +20,26 @@ static TAutoConsoleVariable<float> CVarOceanNormalWeight0(TEXT("Ocean.NormalWeig
 static TAutoConsoleVariable<float> CVarOceanNormalWeight1(TEXT("Ocean.NormalWeight1"), -1.5f, TEXT("Normal/slope contribution weight, cascade 1 (medium waves)."), ECVF_Default);
 static TAutoConsoleVariable<float> CVarOceanNormalWeight2(TEXT("Ocean.NormalWeight2"), -6.0f, TEXT("Normal/slope contribution weight, cascade 2 (fine ripples)."), ECVF_Default);
 
-static TAutoConsoleVariable<float> CVarOceanChoppiness0(TEXT("Ocean.Choppiness0"), 3.0f, TEXT("Horizontal Gerstner displacement weight, cascade 0 (large swells)."), ECVF_Default);
-static TAutoConsoleVariable<float> CVarOceanChoppiness1(TEXT("Ocean.Choppiness1"), 4.0f, TEXT("Horizontal Gerstner displacement weight, cascade 1 (medium waves)."), ECVF_Default);
-static TAutoConsoleVariable<float> CVarOceanChoppiness2(TEXT("Ocean.Choppiness2"), 3.0f, TEXT("Horizontal Gerstner displacement weight, cascade 2 (fine ripples)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarOceanChoppiness0(TEXT("Ocean.Choppiness0"), 3.0f, TEXT("Horizontal choppy displacement weight, cascade 0 (large swells)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarOceanChoppiness1(TEXT("Ocean.Choppiness1"), 4.0f, TEXT("Horizontal choppy displacement weight, cascade 1 (medium waves)."), ECVF_Default);
+static TAutoConsoleVariable<float> CVarOceanChoppiness2(TEXT("Ocean.Choppiness2"), 3.0f, TEXT("Horizontal choppy displacement weight, cascade 2 (fine ripples)."), ECVF_Default);
 
 //Off by default, flip on with "Ocean.DebugLog 1" to confirm the sim's actually
 //producing non-zero data if a height map ever looks wrong.
 static TAutoConsoleVariable<int32> CVarOceanDebugLog(TEXT("Ocean.DebugLog"), 0, TEXT("Periodically make debug log entries."), ECVF_Default);
 
 //PRESET TABLE
-//The numbers behind the Ocean/Tropical/Murky dropdown. Wave related values were tuned by eye,
-//optical values come from actual water-optics data not handpicked colours - Pope & Fry 97
-//for open ocean absorption, Jerlov 76 water types for the coastal/turbid ones.
+//The numbers behind the Ocean/Tropical/Murky dropdown. Wave related values were tuned by eye.
+//Ocean absorption is Pope & Fry 97 (pure water), the rest of the optical values are hand tuned
+//to sit along Jerlov 76 water types for the coastal/turbid ones.
 FWaterPresetSettings UOceanFFTSubsystem::GetPresetSettings(EWaterPreset Preset)
 {
 	FWaterPresetSettings Settings;
 	switch (Preset)
 	{
 	case EWaterPreset::Ocean:
-		//Clear open ocean. Pope & Fry 97 absorption spectrum + Jerlov Type I scattering,
-		//converted from 1/m to Unreal's 1/cm.
+		//Clear open ocean. Pope & Fry 97 absorption, converted from 1/m to Unreal's 1/cm.
+		//Scattering is hand set to roughly Jerlov Type I levels.
 		Settings.WindSpeed = 600.0f;
 		Settings.WindDirection = FVector2D(1.0, 0.3);
 		Settings.Amplitude = 6.0f;
@@ -63,7 +63,7 @@ FWaterPresetSettings UOceanFFTSubsystem::GetPresetSettings(EWaterPreset Preset)
 
 	case EWaterPreset::Murky:
 	default:
-		//Turbid sediment-heavy river/lake water. Suspended sediment scatters LONGER (red) wavelengths more than short ones, opposite of clear ocean.
+		//Turbid sediment-heavy river/lake water. Blue gets absorbed hardest which is what makes it brown, the red heavy scattering pushes it more brown (look choice, not measured).
 		Settings.WindSpeed = 120.0f;
 		Settings.WindDirection = FVector2D(0.6, 1.0);
 		Settings.Amplitude = 0.8f;
@@ -344,8 +344,9 @@ void UOceanFFTSubsystem::Tick(float DeltaTime)
 		}
 	}
 
+	//only when Ocean.DebugLog is on - reading the RT back stalls the GPU so it shouldnt run normally
 	DiagnosticFrameCounter++;
-	if (DiagnosticFrameCounter % 90 == 1 && Cascades.Num() > 0 && Cascades[0].HeightRenderTarget)
+	if (CVarOceanDebugLog.GetValueOnGameThread() != 0 && DiagnosticFrameCounter % 90 == 1 && Cascades.Num() > 0 && Cascades[0].HeightRenderTarget)
 	{
 		TArray<FLinearColor> OutPixels;
 		FTextureRenderTargetResource* DiagRes = Cascades[0].HeightRenderTarget->GameThread_GetRenderTargetResource();

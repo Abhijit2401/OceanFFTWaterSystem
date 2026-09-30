@@ -33,7 +33,7 @@ public:
 	}
 };
 
-//Evolves H0 to time t (deep water dispersion), plus the Gerstner style choppy displacement spectraDx/Dy = i*(k/|k|) * H(k,t). Feeds their own FFTs next.
+//Evolves H0 to time t (deep water dispersion), plus the choppy displacement spectra Dx/Dy = i*(k/|k|) * H(k,t). Feeds their own FFTs next.
 class FOceanTimeSpectrumCS : public FGlobalShader
 {
 public:

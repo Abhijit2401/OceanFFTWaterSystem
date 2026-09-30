@@ -6,7 +6,7 @@
 //     Phillips wind spectrum + precomputed Gaussian noise. Only runs once per cascade
 //     unless wind changes.
 //  2. TimeSpectrumCS - evolves H0 to time t (deep water dispersion), also spits out the
-//     horizontal Gerstner/choppy displacement spectra.
+//     horizontal choppy displacement spectra.
 //  3. FFTButterflyCS - inverse FFT of all 3 spectra back to a spatial field. log2(N)
 //     passes for rows then log2(N) for columns.
 //  4. InversionCS - undoes the FFT checkerboard flip and packs everything into the
@@ -108,10 +108,10 @@ void TimeSpectrumCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float2 Hkt = ComplexMul(H0K, EulerPos) + ComplexMul(H0MinusKConj, EulerNeg);
 	HktOutput[Pos] = Hkt;
 
-	//choppy/Gerstner displacement: D(k,t) = i * (k/|k|) * H(k,t), from Tessendorf 2001.
+	//choppy displacement: D(k,t) = i * (k/|k|) * H(k,t), from Tessendorf 2001.
 	//the *i (90 degree rotation, done below as ComplexMul against float2(0, KDir)) is what
 	//pulls the mesh toward wave crests and away from troughs after the inverse FFT - turns
-	//plain up/down bobbing into actual poinetd Gerstner crests
+	//plain up/down bobbing into actual pointed crests (same idea as the sideways motion in Gerstner waves)
 	float2 KDir = K / KLen;
 	float2 IKx = float2(0.0f, KDir.x);
 	float2 IKy = float2(0.0f, KDir.y);
